@@ -20,7 +20,7 @@ module Suitcase
 
     # Public: The Amenities that can be passed in to searches, and are returned
     #         from many queries.
-    AMENITIES = { 
+    AMENITIES = {
       pool: 1,
       fitness_center: 2,
       restaurant: 3,
@@ -41,7 +41,7 @@ module Suitcase
                   :hotel_in_destination, :proximity_distance,
                   :property_description, :number_of_floors, :number_of_rooms,
                   :deep_link, :tripadvisor_rating, :general_policies,
-                  :checkin_instructions, :general_policies, :raw
+                  :checkin_instructions, :general_policies, :raw, :roomz
 
     # Internal: Initialize a new Hotel.
     #
@@ -145,15 +145,25 @@ module Suitcase
       elsif params[:location]
         params["destinationString"] = params[:location]
         params.delete(:location)
+      elsif params[:radius]
+        params[:latitude] = params.delete(:latitude)
+        params[:longitude] = params.delete(:longitude)
+        params[:searchRadius] = params.delete(:radius)
+        params[:searchRadiusUnit] = params.delete(:searchRadiusUnit)
       end
 
-      amenities = params[:amenities] ? params[:amenities].map {|amenity| 
-        AMENITIES[amenity] 
+      amenities = params[:amenities] ? params[:amenities].map {|amenity|
+        AMENITIES[amenity]
       }.join(",") : nil
       params[:amenities] = amenities if amenities
 
       params["minRate"] = params[:min_rate] if params[:min_rate]
       params["maxRate"] = params[:max_rate] if params[:max_rate]
+
+      params["arrivalDate"] = params.delete(:arrival_date) if params[:arrival_date]
+      params["departureDate"] = params.delete(:departure_date) if params[:departure_date]
+
+      params.merge!(parameterize_rooms(params.delete(:rooms) || [{ adults: 1 }]))
 
       if Configuration.cache? and Configuration.cache.cached?(:list, params)
         parsed = Configuration.cache.get_query(:list, params)
@@ -182,7 +192,7 @@ module Suitcase
     # Returns a reformatted Hash with the specified accessors.
     def self.parse_information(parsed)
       handle_errors(parsed)
-      
+
       if parsed["hotelId"]
         summary = parsed
         parsed_info = {}
@@ -231,6 +241,7 @@ module Suitcase
       parsed_info[:amenity_mask] = summary["amenityMask"]
       parsed_info[:masked_amenities] = Amenity.parse_mask(parsed_info[:amenity_mask])
 
+      parsed_info[:roomz] = self.parse_rooms_information(summary["RoomRateDetailsList"]) if summary["RoomRateDetailsList"]
       parsed_info
     end
 
@@ -243,7 +254,7 @@ module Suitcase
       images = parsed["HotelInformationResponse"]["HotelImages"]["HotelImage"].map do |image_data|
         Suitcase::Image.new(image_data)
       end if parsed["HotelInformationResponse"] && parsed["HotelInformationResponse"]["HotelImages"] && parsed["HotelInformationResponse"]["HotelImages"]["HotelImage"]
-      
+
       unless parsed["thumbNailUrl"].nil? or parsed["thumbNailUrl"].empty?
         images = [Suitcase::Image.new("thumbnailURL" => "http://images.travelnow.com" + parsed["thumbNailUrl"])]
       end
@@ -302,43 +313,40 @@ module Suitcase
       supplier_type = hotel_room_res[0]["supplierType"]
       Hotel.update_session(parsed, info[:session])
 
-      hotel_room_res.map do |raw_data|
-        room_data = {}
-        room_data[:non_refundable] = raw_data["nonRefundable"]
-        room_data[:deposit_required] = raw_data["depositRequired"]
-        room_data[:guarantee_only] = raw_data["guaranteeRequired"]
-        room_data[:cancellation_policy] = raw_data["cancellationPolicy"]
-        room_data[:rate_code] = raw_data["rateCode"]
-        room_data[:room_type_code] = raw_data["roomTypeCode"]
-        room_data[:room_type_description] = raw_data["roomTypeDescription"]
-        room_data[:rate_description] = raw_data["rateDescription"]
-        room_data[:promo] = raw_data["RateInfo"]["@promo"].to_b
-        room_data[:price_breakdown] = raw_data["RateInfo"]["ChargeableRateInfo"]["NightlyRatesPerRoom"]["NightlyRate"].map do |raw|
-          NightlyRate.new(raw)
-        end if raw_data["RateInfo"]["ChargeableRateInfo"] && raw_data["RateInfo"]["ChargeableRateInfo"]["NightlyRatesPerRoom"] && raw_data["RateInfo"]["ChargeableRateInfo"]["NightlyRatesPerRoom"]["NightlyRate"].is_a?(Array)
-        room_data[:total_price] = raw_data["RateInfo"]["ChargeableRateInfo"]["@total"]
-        room_data[:max_nightly_rate] = raw_data["RateInfo"]["ChargeableRateInfo"]["@maxNightlyRate"]
-        room_data[:rate_change] = raw_data["rateChange"]
-        room_data[:nightly_rate_total] = raw_data["RateInfo"]["ChargeableRateInfo"]["@nightlyRateTotal"]
-        room_data[:average_nightly_rate] = raw_data["RateInfo"]["ChargeableRateInfo"]["@averageRate"]
-        room_data[:arrival] = info[:arrival]
-        room_data[:departure] = info[:departure]
-        room_data[:rate_key] = rate_key
-        room_data[:hotel_id] = hotel_id
-        room_data[:supplier_type] = supplier_type
-        room_data[:rooms] = params[:rooms]
-        room_data[:surcharges] = raw_data["RateInfo"]["ChargeableRateInfo"] &&
-          raw_data["RateInfo"]["ChargeableRateInfo"]["Surcharges"] &&
-          [raw_data["RateInfo"]["ChargeableRateInfo"]["Surcharges"]["Surcharge"]].
-          flatten.map { |s| Surcharge.parse(s) }
-        room_data[:bed_types] = [raw_data["BedTypes"]["BedType"]].flatten.map do |x|
-          BedType.new(id: x["@id"], description: x["description"])
-        end if raw_data["BedTypes"] && raw_data["BedTypes"]["BedType"]
+      parse_rooms_information(hotel_room_res)
+    end
 
-        r = Room.new(room_data)
-        r.raw = parsed
-        r
-      end
+    def self.parse_rooms_information(parsed)
+      raw_data = parsed["RoomRateDetails"]
+      room_data = {}
+      room_data[:non_refundable] = raw_data["nonRefundable"]
+      room_data[:deposit_required] = raw_data["depositRequired"]
+      room_data[:guarantee_only] = raw_data["guaranteeRequired"]
+      room_data[:cancellation_policy] = raw_data["cancellationPolicy"]
+      room_data[:rate_code] = raw_data["rateCode"]
+      room_data[:room_type_code] = raw_data["roomTypeCode"]
+      room_data[:room_type_description] = raw_data["roomTypeDescription"]
+      room_data[:rate_description] = raw_data["rateDescription"]
+      room_data[:promo] = raw_data["RateInfo"]["@promo"].to_b
+      room_data[:price_breakdown] = raw_data["RateInfo"]["ChargeableRateInfo"]["NightlyRatesPerRoom"]["NightlyRate"].map do |raw|
+        NightlyRate.new(raw)
+      end if raw_data["RateInfo"]["ChargeableRateInfo"] && raw_data["RateInfo"]["ChargeableRateInfo"]["NightlyRatesPerRoom"] && raw_data["RateInfo"]["ChargeableRateInfo"]["NightlyRatesPerRoom"]["NightlyRate"].is_a?(Array)
+      room_data[:total_price] = raw_data["RateInfo"]["ChargeableRateInfo"]["@total"]
+      room_data[:max_nightly_rate] = raw_data["RateInfo"]["ChargeableRateInfo"]["@maxNightlyRate"]
+      room_data[:rate_change] = raw_data["rateChange"]
+      room_data[:nightly_rate_total] = raw_data["RateInfo"]["ChargeableRateInfo"]["@nightlyRateTotal"]
+      room_data[:average_nightly_rate] = raw_data["RateInfo"]["ChargeableRateInfo"]["@averageRate"]
+      room_data[:surcharges] = raw_data["RateInfo"]["ChargeableRateInfo"] &&
+        raw_data["RateInfo"]["ChargeableRateInfo"]["Surcharges"] &&
+        [raw_data["RateInfo"]["ChargeableRateInfo"]["Surcharges"]["Surcharge"]].
+        flatten.map { |s| Surcharge.parse(s) }
+      room_data[:bed_types] = [raw_data["BedTypes"]["BedType"]].flatten.map do |x|
+        BedType.new(id: x["@id"], description: x["description"])
+      end if raw_data["BedTypes"] && raw_data["BedTypes"]["BedType"]
+
+      r = Room.new(room_data)
+      r.raw = parsed
+      r
     end
   end
 end
